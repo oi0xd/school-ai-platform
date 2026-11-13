@@ -2,18 +2,14 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# تهيئة مسار الكاش لـ Hugging Face لتفادي مشاكل الصلاحيات في Spaces
-ENV HF_HOME=/tmp/huggingface
-ENV TRANSFORMERS_CACHE=/tmp/huggingface
-
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN chmod -R 777 /app
-
+# المنصة تحدد المنفذ عبر متغير البيئة PORT
+ENV PORT=7860
 EXPOSE 7860
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}"]
+# قراءة المنفذ من متغير البيئة
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]

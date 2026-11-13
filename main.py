@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 # تحميل المتغيرات البيئية من ملف .env
 load_dotenv()
+os.environ.setdefault("HF_HOME", "/tmp/huggingface")
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
