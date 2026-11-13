@@ -12,7 +12,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
+import onnxruntime as ort
+from huggingface_hub import hf_hub_download
+from tokenizers import Tokenizer
 
 app = FastAPI(title="منصة المواد الذكية")
 
@@ -43,7 +45,38 @@ STOP_WORDS = {
 }
 
 print("⏳ جاري تحميل النموذج والذاكرة...")
-EMBED_MODEL = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+class ONNXEmbedder:
+    def __init__(self, repo_id="oi0xd/rag-embed-onnx"):
+        print("⏳ تحميل نموذج ONNX...")
+        model_path = hf_hub_download(repo_id=repo_id, filename="model.onnx")
+        tokenizer_path = hf_hub_download(repo_id=repo_id, filename="tokenizer.json")
+        
+        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        self.tokenizer = Tokenizer.from_file(tokenizer_path)
+        self.tokenizer.enable_truncation(max_length=128)
+        self.tokenizer.enable_padding()
+
+    def encode(self, texts):
+        encodings = self.tokenizer.encode_batch(texts)
+        input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
+        attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
+        token_type_ids = np.array([e.type_ids for e in encodings], dtype=np.int64)
+        
+        inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "token_type_ids": token_type_ids}
+        input_names = [i.name for i in self.session.get_inputs()]
+        inputs = {k: v for k, v in inputs.items() if k in input_names}
+
+        outputs = self.session.run(None, inputs)[0]
+        
+        mask = np.expand_dims(attention_mask, -1).astype(np.float32)
+        summed = np.sum(outputs * mask, axis=1)
+        counted = np.clip(np.sum(mask, axis=1), 1e-9, None)
+        embeddings = summed / counted
+
+        embeddings = embeddings / np.clip(np.linalg.norm(embeddings, axis=1, keepdims=True), 1e-9, None)
+        return embeddings
+
+EMBED_MODEL = ONNXEmbedder("oi0xd/rag-embed-onnx")
 
 # قاموس لتخزين بيانات كل مادة
 SUBJECTS = {}

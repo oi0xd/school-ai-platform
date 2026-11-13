@@ -23,3 +23,6 @@ Thumbs.db
 
 # قواعد البيانات المحلية المؤقتة
 chroma_db/
+
+# مجلد نموذج ONNX المحلي (يتم تحميله من Hugging Face بدلاً من رفعه لـ GitHub)
+onnx_model/

@@ -3,5 +3,7 @@ uvicorn[standard]
 pydantic
 requests
 numpy
-sentence-transformers
+onnxruntime
+tokenizers
+huggingface_hub
 python-dotenv
