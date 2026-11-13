@@ -1,0 +1,218 @@
+# -*- coding: utf-8 -*-
+import json
+import re
+import numpy as np
+import requests
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+
+app = FastAPI(title="مساعد المنهج الدراسي")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+PROXY_URL   = "https://mahdi.higivv77vv.workers.dev"
+CHUNKS_FILE = "chunks.json"
+EMB_FILE    = "embeddings.npy"
+
+TOP_K          = 5
+SEMANTIC_W     = 0.7
+KEYWORD_W      = 0.3
+BOOST          = 0.15  # مكافأة للقطع التي تحتوي على كلمة مفتاحية
+REFUSAL_THRESH = 0.15 
+NEIGHBOR_WINDOW = 1
+
+# كلمات التوقف (تمت إضافة الأشكال المطَبّعة أيضاً مثل الي)
+STOP_WORDS = {
+    "ما", "هو", "هي", "هل", "من", "في", "على", "عن", "الى", "الي", "إلى",
+    "تعريف", "اشرح", "وضح", "اذكر", "ماذا", "كيف", "لماذا", "ال",
+    "و", "او", "أو", "ثم", "هذا", "هذه", "ذلك", "تلك", "بما", "لما",
+    "ب", "ل", "يوجد", "توجد", "الموجود", "الموجودة",
+}
+
+print("⏳ جاري تحميل الذاكرة والنموذج...")
+with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
+    CHUNKS = json.load(f)
+EMBEDDINGS = np.load(EMB_FILE)
+NORMS = np.linalg.norm(EMBEDDINGS, axis=1, keepdims=True)
+NORMS[NORMS == 0] = 1
+EMBEDDINGS_N = EMBEDDINGS / NORMS
+
+EMBED_MODEL = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+print("✅ الذاكرة جاهزة!")
+
+def semantic_scores(query: str) -> np.ndarray:
+    q = EMBED_MODEL.encode([query])[0].astype(np.float32)
+    q = q / (np.linalg.norm(q) + 1e-9)
+    return EMBEDDINGS_N @ q
+
+# ================= توحيد الأشكال العربية =================
+def normalize_ar(text: str) -> str:
+    text = re.sub(r"[\u064B-\u0652\u0670\u0640]", "", text)  # إزالة التشكيل والتطويل
+    text = re.sub(r"[\u0622\u0623\u0625]", "\u0627", text)   # أ إ آ -> ا
+    text = text.replace("\u0629", "\u0647")                  # ة -> ه
+    text = text.replace("\u0649", "\u064A")                  # ى -> ي
+    text = re.sub(r"\s+", " ", text)                         # توحيد المسافات
+    return text.strip()
+
+def tokenize(text: str) -> set:
+    text = normalize_ar(text)
+    # نلتقط الحروف العربية فقط (من الألف إلى الياء) لاستبعاد علامات الترقيم مثل ؟
+    words = re.findall(r"[\u0621-\u064A]+", text) 
+    result = set()
+    for w in words:
+        if w in STOP_WORDS:
+            continue
+        if w.startswith("ال") and len(w) > 4:
+            w = w[2:]
+        if len(w) > 2:
+            result.add(w)
+    return result
+
+def query_variants(query: str) -> set:
+    q_words = tokenize(query)
+    variants = set()
+    for w in q_words:
+        variants.add(w)
+        if len(w) >= 4:
+            variants.add(w.replace("ئ", "ي"))  # الموائع -> الموايع
+            variants.add(w.replace("ئ", "ى"))  # الموائع -> الموائى
+            variants.add(w.replace("ئ", "ا"))  # الموائع -> الموائع
+    return variants
+
+def keyword_scores(query: str) -> np.ndarray:
+    q_variants = query_variants(query)
+    if not q_variants:
+        return np.zeros(len(CHUNKS))
+
+    normalized_chunks = [normalize_ar(ch) for ch in CHUNKS]
+    scores = np.zeros(len(CHUNKS))
+    
+    for i, ch_norm in enumerate(normalized_chunks):
+        hits = 0
+        for qw in q_variants:
+            # مطابقة كلمة كاملة أو مطابقة جزئية (للكلمات التي 4 أحرف أو أكثر)
+            if re.search(r"\b" + re.escape(qw) + r"\b", ch_norm) or (len(qw) >= 4 and qw in ch_norm):
+                hits += 1
+        if hits > 0:
+            scores[i] = hits / len(q_variants)
+
+    if scores.max() > 0:
+        scores = scores / scores.max()
+    return scores
+
+def hybrid_retrieve(query: str):
+    sem = semantic_scores(query)
+    kw  = keyword_scores(query)
+    hybrid = SEMANTIC_W * sem + KEYWORD_W * kw
+
+    # مكافأة للقطع التي تحتوي على كلمة مفتاحية
+    kw_raw = kw > 0 
+    hybrid = hybrid + BOOST * kw_raw
+
+    top_idx = np.argsort(hybrid)[::-1][:TOP_K]
+    return [
+        {"index": int(i), "score": float(hybrid[i]),
+         "semantic": float(sem[i]), "keyword": float(kw[i])}
+        for i in top_idx
+    ]
+
+def expand_with_neighbors(results: list) -> list:
+    expanded = set()
+    for r in results:
+        i = r["index"]
+        for j in range(i - NEIGHBOR_WINDOW, i + NEIGHBOR_WINDOW + 1):
+            if 0 <= j < len(CHUNKS):
+                expanded.add(j)
+    core = {r["index"] for r in results}
+    return [{"index": j, "is_core": j in core, "text": CHUNKS[j]} for j in sorted(expanded)]
+
+def ask_llm(query: str, context_blocks: list) -> str:
+    context_text = "\n\n".join(
+        ("★ " if b["is_core"] else "  ") + f"[مقطع {b['index']}]\n{b['text']}"
+        for b in context_blocks
+    )
+
+    system_prompt = (
+        "أنت مساعد علمي يجيب من كتاب مدرسي مقدم لك في السياق.\n\n"
+        "القواعد:\n"
+        "1. اجعل إجاباتك مبنية على المعلومات الموجودة في السياق فقط.\n"
+        "2. إذا طلب الطالب (تعريف) لمفهوم، ولم تجد في السياق جملة صريحة بصيغة (هو كذا)، فاستنتج التعريف بنفسك من الخواص والأمثلة المذكورة.\n"
+        "3. اربط الإجابة بالخواص والأمثلة الواردة في السياق.\n"
+        "4. فقط إذا كان السياق لا يحتوي على أي معلومة ذات صلة، اكتب: لا يوجد في المنهج\n\n"
+        f"السياق:\n{context_text}"
+    )
+
+    resp = requests.post(
+        PROXY_URL,
+        headers={"Content-Type": "application/json"},
+        json={"prompt": f"{system_prompt}\n\nالسؤال: {query}"},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()["text"]
+
+class AskRequest(BaseModel):
+    question: str
+
+@app.post("/ask")
+def ask(req: AskRequest):
+    query = req.question.strip()
+    if not query:
+        return {"error": "لا يوجد سؤال"}
+
+    results = hybrid_retrieve(query)
+    best_score = results[0]["score"] if results else 0.0
+
+    if best_score < REFUSAL_THRESH:
+        print(f"❌ رفض مبكر: أفضل نتيجة {best_score} أقل من العتبة {REFUSAL_THRESH}")
+        return {"answer": "لا يوجد في المنهج", "context_used": []}
+
+    blocks = expand_with_neighbors(results)
+    answer = ask_llm(query, blocks)
+
+    return {"answer": answer, "context_used": [b["text"] for b in blocks]}
+
+@app.get("/debug-chunk/{chunk_id}")
+def debug_chunk(chunk_id: int):
+    if chunk_id < 0 or chunk_id >= len(CHUNKS):
+        return {"error": "خارج النطاق", "total": len(CHUNKS)}
+    raw = CHUNKS[chunk_id]
+    norm = normalize_ar(raw)
+    return {
+        "index": chunk_id,
+        "length": len(raw),
+        "raw_preview": raw[:500],
+        "normalized_preview": norm[:500],
+        "contains_مائع_root": "مائع" in norm,
+        "contains_موائع": "موائع" in norm,
+        "contains_موايع": "موايع" in norm,
+    }
+
+@app.post("/debug-search")
+def debug_search(req: AskRequest):
+    sem = semantic_scores(req.question)
+    kw  = keyword_scores(req.question)
+    hybrid = SEMANTIC_W * sem + KEYWORD_W * kw
+    hybrid = hybrid + BOOST * (kw > 0)
+    top5 = np.argsort(hybrid)[::-1][:5]
+    return {
+        "top": [
+            {"index": int(i), "hybrid": float(hybrid[i]),
+             "semantic": float(sem[i]), "keyword": float(kw[i]),
+             "preview": CHUNKS[i][:120]}
+            for i in top5
+        ],
+        "stats": {"semantic_max": float(sem.max()), "semantic_mean": float(sem.mean())},
+    }
+
+@app.get("/")
+def read_root():
+    return {"message": "خادم المنصة يعمل بنجاح!"}

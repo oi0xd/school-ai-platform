@@ -1,0 +1,25 @@
+# البيئة الافتراضية - Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# المتغيرات البيئية الحساسة - Environment Variables & Secrets
+.env
+.env*.local
+
+# ملفات بايثون المؤقتة والكاش - Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# بيئات التطوير وأنظمة التشغيل - IDE & OS Metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# قواعد البيانات المحلية المؤقتة
+chroma_db/
