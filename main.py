@@ -4,6 +4,7 @@ import re
 import numpy as np
 import os
 import requests
+import threading
 from dotenv import load_dotenv
 
 # تحميل المتغيرات البيئية من ملف .env
@@ -77,7 +78,17 @@ class ONNXEmbedder:
         embeddings = embeddings / np.clip(np.linalg.norm(embeddings, axis=1, keepdims=True), 1e-9, None)
         return embeddings
 
-EMBED_MODEL = ONNXEmbedder("oi0xd/rag-embed-onnx")
+EMBED_MODEL = None
+
+def load_model():
+    global EMBED_MODEL
+    print("⏳ تحميل نموذج ONNX في الخلفية...")
+    EMBED_MODEL = ONNXEmbedder("oi0xd/rag-embed-onnx")
+    print("✅ تم تحميل النموذج.")
+
+@app.on_event("startup")
+def startup_event():
+    threading.Thread(target=load_model, daemon=True).start()
 
 # قاموس لتخزين بيانات كل مادة
 SUBJECTS = {}
@@ -215,6 +226,9 @@ class AskRequest(BaseModel):
 
 @app.post("/ask")
 def ask(req: AskRequest):
+    if EMBED_MODEL is None:
+        return {"answer": "النموذج قيد التحميل في الخلفية حالياً، يرجى الانتظار بضع ثوانٍ وإعادة المحاولة.", "context_used": []}
+
     query = req.question.strip()
     if not query: return {"error": "لا يوجد سؤال"}
 
